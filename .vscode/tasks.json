@@ -1,0 +1,15 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run Animated Rainfall Map",
+			"type": "shell",
+			"command": "/Users/zhangdanyi/Desktop/课程文件/myenv/zdy_assignment-2/1/.venv/bin/python",
+			"args": [
+				"animated_rainfall_map.py"
+			],
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}
