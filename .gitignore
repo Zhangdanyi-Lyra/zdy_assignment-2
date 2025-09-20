@@ -1,0 +1,18 @@
+# Generated visualization outputs (large HTML files)
+outputs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# VS Code settings (keep tasks.json tracked, ignore others)
+!.vscode/tasks.json
+.vscode/*
+
+# OS files
+.DS_Store
+
+# Notebooks checkpoints
+.ipynb_checkpoints/

@@ -15,6 +15,7 @@ def parse_args():
     p.add_argument('--arrow-scale-km', type=float, default=2.0, help='Arrow length scale (km per m/s)')
     p.add_argument('--arrow-head-deg', type=float, default=25.0, help='Arrow head half-angle (degrees)')
     p.add_argument('--arrow-head-scale', type=float, default=0.5, help='Arrow head length as fraction of shaft')
+    p.add_argument('--arrow-width-scale', type=float, default=1.0, help='Global scale for wind arrow line widths')
     p.add_argument('--fps', type=int, default=3, help='Playback speed (approx frames per second)')
     # Temperature color range
     p.add_argument('--tmin', type=float, default=None, help='Fixed temperature min for color scale (°C)')
@@ -59,6 +60,31 @@ def parse_args():
     p.add_argument('--ray-undulate-waves', type=float, default=1.5, help='Number of waves along the ray length')
     p.add_argument('--ray-undulate-period', type=float, default=18.0, help='Frames per undulation cycle (lower=faster)')
     p.add_argument('--ray-undulate-decay', type=float, default=1.2, help='Amplitude scales ~ s^decay from base to tip (s in [0,1])')
+    # Firework burst effect (optional overlay)
+    p.add_argument('--firework', action='store_true', help='Enable firework-like burst particles from city centers')
+    p.add_argument('--fw-sparks', type=int, default=18, help='Number of sparks per city per burst')
+    p.add_argument('--fw-burst-period', type=int, default=24, help='Frames per burst cycle')
+    p.add_argument('--fw-burst-jitter', type=float, default=0.4, help='Random phase jitter per city (0-1)')
+    p.add_argument('--fw-expansion-km', type=float, default=220.0, help='Max expansion radius in km')
+    p.add_argument('--fw-fade-power', type=float, default=2.2, help='Spark opacity falloff power with progress')
+    p.add_argument('--fw-spark-size', type=float, default=6.0, help='Base size of sparks')
+    # Firework trails and core flash
+    p.add_argument('--fw-trail', action='store_true', help='Enable spark trails (fading points along the path)')
+    p.add_argument('--fw-trail-samples', type=int, default=5, help='Number of samples per spark trail')
+    p.add_argument('--fw-trail-span', type=float, default=0.35, help='Trail span as fraction of cycle behind current progress')
+    p.add_argument('--fw-trail-fade', type=float, default=1.5, help='Additional fade power for trails')
+    p.add_argument('--fw-trail-size-scale', type=float, default=0.7, help='Relative size of trail points vs spark size')
+    p.add_argument('--fw-core', action='store_true', help='Enable bright core flash at burst center')
+    p.add_argument('--fw-core-duration', type=float, default=0.18, help='Core flash duration fraction of cycle (0-1)')
+    p.add_argument('--fw-core-size', type=float, default=10.0, help='Core flash size')
+    p.add_argument('--fw-core-alpha', type=float, default=0.95, help='Max alpha of core flash')
+    # Background music
+    p.add_argument('--bgm', type=str, default=None, help='Background music file path or URL (mp3/ogg)')
+    p.add_argument('--bgm-volume', type=float, default=0.35, help='Initial volume 0-1')
+    p.add_argument('--bgm-loop', action='store_true', help='Loop background music')
+    p.add_argument('--bgm-autoplay', action='store_true', help='Attempt autoplay (will start muted due to browser policy)')
+    p.add_argument('--bgm-controls', action='store_true', default=True, help='Show audio controls bottom-left (default on)')
+    p.add_argument('--bgm-unmute-onclick', action='store_true', help='Unmute and play on first user click/touch')
     # Color binning for ray gradients
     p.add_argument('--ray-color-bins', type=int, default=8, help='Number of temperature bins for ray coloring gradients')
     # One-shot lightweight preset (applies after parse)
@@ -383,10 +409,11 @@ for frame_idx, (d, g) in enumerate(agg.groupby('frame_str')):
         # alpha mapping (smooth)
         a_outer = 0.10 + 0.35 * t
         a_mid = 0.16 + 0.44 * t
-        # widths (smooth, slightly thinner at low wind)
-        w_outer = 4.5 + 3.0 * t
-        w_mid = 2.5 + 1.5 * t
-        w_main = 1.2 + 0.8 * t
+        # widths (smooth, slightly thinner at low wind), scaled globally
+        aws = max(0.01, float(getattr(args, 'arrow_width_scale', 1.0)))
+        w_outer = (4.5 + 3.0 * t) * aws
+        w_mid = (2.5 + 1.5 * t) * aws
+        w_main = (1.2 + 0.8 * t) * aws
         # colors
         col_outer = f'rgba(0,200,255,{a_outer:.3f})'
         col_mid = f'rgba(150,230,255,{a_mid:.3f})'
@@ -643,6 +670,81 @@ for frame_idx, (d, g) in enumerate(agg.groupby('frame_str')):
             tail_marker = dict(size=max(1.0, args.tail_size * float(getattr(args, 'tail_size_scale', 1.0))), color=tail_color, line=dict(width=0))
             rays_traces.append(go.Scattergeo(lon=tail_lon, lat=tail_lat, mode='markers', marker=tail_marker, name='Ray Tails', showlegend=False))
 
+    # Optional firework particles overlay
+    firework_traces = []
+    if getattr(args, 'firework', False):
+        rng_fw = np.random.default_rng(2025 + frame_idx)
+        sparks_lon, sparks_lat, sparks_col, sparks_size = [], [], [], []
+        trails_lon, trails_lat, trails_col, trails_size = [], [], [], []
+        core_lon, core_lat, core_col, core_size = [], [], [], []
+        # Use all cities or topK windy cities for bursts (reuse rays_topk logic)
+        g_fw = g.copy()
+        if args.rays_topk is not None and args.rays_topk > 0:
+            g_fw = g_fw.sort_values('wind', ascending=False).head(args.rays_topk)
+        for _, rw in g_fw.iterrows():
+            latc = float(rw['lat']); lonc = float(rw['lon'])
+            tval = float(rw['temp']) if pd.notna(rw['temp']) else (t_min + t_max) * 0.5
+            base_rgb = temp_to_rgb(tval, t_min, t_max)
+            # per-city phase
+            base_phase = rng_fw.random() * float(args.fw_burst_jitter)
+            p = (frame_idx / max(1, int(args.fw_burst_period)) + base_phase) % 1.0
+            # smoother start/end using ease in/out
+            ease = 0.5 - 0.5 * np.cos(np.pi * p)
+            Rkm = float(args.fw_expansion_km) * ease
+            # size and alpha by progress
+            alpha = float(np.clip((1.0 - p) ** float(args.fw_fade_power), 0.05, 0.95))
+            inner_rgb = lighten_rgb(base_rgb, 0.15)
+            col_rgba = _rgb_to_rgba_str(inner_rgb, alpha)
+            nsp = max(3, int(args.fw_sparks))
+            # random slight jitter per spark
+            ang = np.linspace(0, 2*np.pi, nsp, endpoint=False) + rng_fw.uniform(-0.06, 0.06, size=nsp)
+            # convert km to degrees around city
+            coslr = np.cos(np.deg2rad(latc))
+            dlon = (Rkm / (R * max(0.2, coslr))) * np.sin(ang)
+            dlat = (Rkm / R) * np.cos(ang)
+            lx = (lonc + dlon)
+            ly = (latc + dlat)
+            sparks_lon += lx.tolist()
+            sparks_lat += ly.tolist()
+            sparks_col += [col_rgba] * nsp
+            sparks_size += [float(args.fw_spark_size)] * nsp
+
+            # Trails behind current progress
+            if getattr(args, 'fw_trail', False) and int(args.fw_trail_samples) > 0 and args.fw_trail_span > 0:
+                ns = int(args.fw_trail_samples)
+                span = float(args.fw_trail_span)
+                for si in range(1, ns+1):
+                    pf = np.clip(p - span * (si/ns), 0.0, 1.0)
+                    ease_f = 0.5 - 0.5 * np.cos(np.pi * pf)
+                    Rkm_f = float(args.fw_expansion_km) * ease_f
+                    alpha_f = float(np.clip((1.0 - pf) ** (float(args.fw_fade_power) + float(args.fw_trail_fade)), 0.02, 0.7))
+                    size_f = float(args.fw_spark_size) * float(args.fw_trail_size_scale)
+                    dlon_f = (Rkm_f / (R * max(0.2, coslr))) * np.sin(ang)
+                    dlat_f = (Rkm_f / R) * np.cos(ang)
+                    trails_lon += (lonc + dlon_f).tolist()
+                    trails_lat += (latc + dlat_f).tolist()
+                    trails_col += [_rgb_to_rgba_str(inner_rgb, alpha_f)] * nsp
+                    trails_size += [size_f] * nsp
+
+            # Core flash at the center
+            if getattr(args, 'fw_core', False) and p <= float(args.fw_core_duration):
+                core_lon.append(lonc)
+                core_lat.append(latc)
+                core_col.append(_rgb_to_rgba_str(lighten_rgb(base_rgb, 0.6), float(args.fw_core_alpha)))
+                core_size.append(float(args.fw_core_size))
+        if sparks_lon:
+            firework_traces.append(go.Scattergeo(lon=sparks_lon, lat=sparks_lat, mode='markers',
+                                                 marker=dict(size=sparks_size, color=sparks_col, line=dict(width=0)),
+                                                 name='Firework', showlegend=False))
+        if trails_lon:
+            firework_traces.append(go.Scattergeo(lon=trails_lon, lat=trails_lat, mode='markers',
+                                                 marker=dict(size=trails_size, color=trails_col, line=dict(width=0)),
+                                                 name='Firework Trails', showlegend=False))
+        if core_lon:
+            firework_traces.append(go.Scattergeo(lon=core_lon, lat=core_lat, mode='markers',
+                                                 marker=dict(size=core_size, color=core_col, line=dict(width=0)),
+                                                 name='Firework Core', showlegend=False))
+
     # Legend-only shape mapping traces so bottom legend shows shape=>weather
     legend_shapes = []
     shape_map = [
@@ -661,7 +763,7 @@ for frame_idx, (d, g) in enumerate(agg.groupby('frame_str')):
             name=lbl, showlegend=True, visible='legendonly', hoverinfo='skip'
         ))
 
-    frames.append(go.Frame(data=[humidity_layer, temp_points] + bin_traces + rays_traces + legend_shapes, name=d))
+    frames.append(go.Frame(data=[humidity_layer, temp_points] + bin_traces + rays_traces + firework_traces + legend_shapes, name=d))
 
 first = frames[0].data if frames else []
 fig = go.Figure(data=first, frames=frames)
@@ -711,3 +813,41 @@ if MAPBOX_TOKEN:
 
 fig.write_html(str(OUTPUT_HTML), include_plotlyjs='cdn', auto_play=False)
 print(f'Wrote {OUTPUT_HTML}')
+
+# Inject background music if requested
+if args.bgm:
+    try:
+        html = Path(OUTPUT_HTML).read_text(encoding='utf-8')
+        loop_attr = ' loop' if args.bgm_loop else ''
+        controls_attr = ' controls' if args.bgm_controls else ''
+        autoplay_attr = ' autoplay muted' if args.bgm_autoplay else ''
+        volume = max(0.0, min(1.0, float(args.bgm_volume)))
+        unmute_script = ''
+        if args.bgm_unmute_onclick:
+            unmute_script = (
+                "<script>\n"
+                "(function(){\n"
+                "  const a=document.getElementById('bgm_audio');\n"
+                "  function start(){\n"
+                "    if(!a) return; a.muted=false; a.volume="+str(volume)+"; a.play().catch(()=>{});\n"
+                "    window.removeEventListener('click', start); window.removeEventListener('touchstart', start);\n"
+                "  }\n"
+                "  window.addEventListener('click', start, {once:true});\n"
+                "  window.addEventListener('touchstart', start, {once:true});\n"
+                "})();\n"
+                "</script>"
+            )
+        audio_html = (
+            f"<audio id=\"bgm_audio\" src=\"{args.bgm}\"{loop_attr}{controls_attr}{autoplay_attr} style=\"position:fixed;left:12px;bottom:10px;z-index:9999;opacity:0.85\"></audio>\n"
+            f"<script>document.addEventListener('DOMContentLoaded',function(){{var a=document.getElementById('bgm_audio');if(a){{a.volume={volume};}}}});</script>\n"
+            f"{unmute_script}"
+        )
+        # Inject before closing body if possible
+        if '</body>' in html:
+            html = html.replace('</body>', audio_html + '</body>')
+        else:
+            html += audio_html
+        Path(OUTPUT_HTML).write_text(html, encoding='utf-8')
+        print('Injected BGM into HTML.')
+    except Exception as e:
+        print(f'Failed to inject BGM: {e}')
